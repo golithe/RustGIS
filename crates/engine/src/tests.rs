@@ -395,6 +395,51 @@ fn project_extension_is_rgis_and_legacy_rgisx_opens() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A table file picked inside a File Geodatabase stands for the geodatabase, in `layer.addData`
+/// and `info.fileLayers` alike; through GDAL when it is installed.
+#[cfg(not(target_arch = "wasm32"))]
+#[test]
+fn a_file_inside_a_geodatabase_adds_the_geodatabase() {
+    let dir = std::env::temp_dir().join(format!("rustgis-gdb-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let gdb = dir.join("roads.gdb");
+    let table = gdb.join("a00000001.gdbtable").display().to_string();
+    let mut s = Session::new(Project::default());
+    if rustgis_data::source::gdal::available() {
+        let geojson = dir.join("cities.geojson");
+        std::fs::write(
+            &geojson,
+            r#"{"type":"FeatureCollection","features":[
+{"type":"Feature","properties":{"name":"a"},"geometry":{"type":"Point","coordinates":[8.5,47.4]}},
+{"type":"Feature","properties":{"name":"b"},"geometry":{"type":"Point","coordinates":[7.4,46.9]}}]}"#,
+        )
+        .unwrap();
+        let made = std::process::Command::new("ogr2ogr")
+            .args(["-f", "OpenFileGDB", "-nln", "cities"])
+            .arg(&gdb)
+            .arg(&geojson)
+            .status()
+            .is_ok_and(|st| st.success());
+        if made {
+            let listed = s.run("info.fileLayers", &json!({"path": table})).unwrap();
+            assert_eq!(listed["layers"], json!(["cities"]), "{listed}");
+            let added = s.run("layer.addData", &json!({"path": table})).unwrap();
+            assert_eq!(added["features"], json!(2), "{added}");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+    }
+    // Without GDAL the geodatabase can't be read, but the error names it, not the table.
+    std::fs::create_dir_all(&gdb).unwrap();
+    std::fs::write(&table, b"").unwrap();
+    for cmd in ["layer.addData", "info.fileLayers"] {
+        let e = s.run(cmd, &json!({"path": table})).unwrap_err();
+        assert!(e.contains("roads.gdb") && !e.contains("gdbtable"), "{cmd}: {e}");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn save_clears_dirty_and_open_clears_history() {
     let mut s = world();
@@ -1004,6 +1049,11 @@ fn hostile_params_never_panic() {
         json!({"database": "MARIADB://u@h:99999999/%zz?ssl-mode=VERIFY_CA&ssl-ca=/nonexistent", "sql": "SELECT 1"}),
         json!({"database": "mssql://u:p#@[::1/x?encrypt=nope", "password": 7, "layer": ":", "crs": "EPSG:-1"}),
         json!({"database": "MSSQL://u@h:99999999/%zz?ca=/nonexistent", "sql": "SELECT 1"}),
+        // Control points that don't parse, then ones that reach a fit.
+        json!({"points": [[], 7, [1, 2, 3, 4, "x"]], "transform": "spline"}),
+        json!({"points": [[0, 0, 1e308, -1e308], [1, 0, -1e308, 1e308], [0, 1, 1e308, 1e308], [1, 1, 0, 0, 0]], "transform": "spline"}),
+        json!({"points": vec![json!([5, 5, 1, 1]); 1000], "compare": true}),
+        json!({"points": [[0, 0, f64::MAX, f64::MAX], [1, 0, -f64::MAX, f64::MAX], [0, 1, f64::MAX, -f64::MAX]], "compare": true}),
     ];
     let ids: Vec<&str> = Session::new(Project::default()).registry.commands.iter().map(|c| c.id).collect();
     let streamed = grid_fgb("hostile", 20);
@@ -2706,6 +2756,26 @@ fn layer_effects_and_imagery_tools() {
         "north up only"
     );
     s.run("raster.georeference", &json!({"layer": dem, "extent": [10.0, 45.0, 10.04, 45.04]})).unwrap();
+    // Control point fits: a sheared grid is affine, a point switched off still gets a residual,
+    // and comparing the transforms recommends the simplest that predicts the points left out.
+    let sheared: Vec<Value> = (0..16)
+        .map(|i| {
+            let (c, r) = (f64::from(i % 4) * 100.0, f64::from(i / 4) * 100.0);
+            json!([c, r, 20.0 + c * 0.001 + r * 0.0002, 50.0 - r * 0.001])
+        })
+        .collect();
+    let mut pts = sheared.clone();
+    pts[5] = json!([100, 100, 20.5, 49.0, 0]);
+    let fit = s.run("raster.gcpFit", &json!({"points": pts, "transform": "affine"})).unwrap();
+    assert_eq!(fit["used"], 15);
+    assert!(fit["rmse"]["map"].as_f64().unwrap() < 1e-9, "{fit}");
+    assert!(fit["residuals"][5]["map"][0].as_f64().unwrap() < -0.3, "the switched-off point misses");
+    let g: Vec<f64> = fit["affine"].as_array().unwrap().iter().map(|v| v.as_f64().unwrap()).collect();
+    assert!((g[1] - 0.001).abs() < 1e-12 && (g[2] - 0.0002).abs() < 1e-12 && (g[5] + 0.001).abs() < 1e-12, "{g:?}");
+    let cmp = s.run("raster.gcpFit", &json!({"points": sheared, "compare": true})).unwrap();
+    assert_eq!(cmp["recommended"], "affine", "{cmp}");
+    assert!(s.run("raster.gcpFit", &json!({"points": [[0, 0, 1, 1]]})).is_err());
+    assert!(s.run("raster.gcpFit", &json!({"points": [[0, 0, 1, 1], [1, 1, 2, 2]], "transform": "magic"})).is_err());
     let sp = s.run("raster.spectral", &json!({"layer": dem, "lon": 10.0205, "lat": 45.0195})).unwrap();
     assert!(sp["values"][0].as_f64().unwrap() > 290.0);
     s.run("raster.index", &json!({"layer": dem, "index": "ndvi", "nir": 1, "red": 1})).unwrap();
@@ -7974,7 +8044,7 @@ fn layout_shapes_are_added_restyled_and_saved() {
         k => panic!("{k:?}"),
     }
     match &l.element(line).unwrap().kind {
-        ElementKind::Line { color, width, dir } => assert_eq!((color.hex(), *width, *dir), ("#123456".into(), 3.0, LineDir::Rising)),
+        ElementKind::Line { color, width, dir, .. } => assert_eq!((color.hex(), *width, *dir), ("#123456".into(), 3.0, LineDir::Rising)),
         k => panic!("{k:?}"),
     }
     // Bad values change nothing.
@@ -8011,6 +8081,103 @@ fn layout_shapes_are_added_restyled_and_saved() {
     // Saved and read back.
     let back: rustgis_map::layout::Layout = serde_json::from_value(serde_json::to_value(&s.project.layouts[li]).unwrap()).unwrap();
     assert_eq!(back, s.project.layouts[li]);
+}
+
+#[test]
+fn layout_arrows_point_turn_and_keep_their_length() {
+    use rustgis_map::layout::{ElementKind, LineHead, line_angle, line_length};
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Arrows", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    // The angle, length, heads and name of a line element.
+    let read = |s: &Session, id: u32| {
+        let e = s.project.layouts[li].element(id).unwrap();
+        match e.kind {
+            ElementKind::Line { dir, head, .. } => {
+                let r = (e.x, e.y, e.w, e.h);
+                (line_angle(r, dir, head), line_length(r, dir), head, e.name.clone(), (e.x + e.w / 2.0, e.y + e.h / 2.0))
+            }
+            ref k => panic!("{k:?}"),
+        }
+    };
+    let id = s.run("layout.addElement", &json!({"kind": "arrow", "angle": 45, "length": 50})).unwrap()["element"].as_u64().unwrap() as u32;
+    let (a, len, head, name, centre) = read(&s, id);
+    assert!((a - 45.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9, "{a}° {len} mm");
+    assert_eq!((head, name.as_str()), (LineHead::End, "Arrow"));
+
+    // Turned to point left: the head moves to the line's start; length and centre stay.
+    s.run("layout.update", &json!({"element": id, "angle": 180})).unwrap();
+    let (a, len, head, _, c) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9, "{a}° {len} mm");
+    assert_eq!(head, LineHead::Start);
+    assert!((c.0 - centre.0).abs() < 1e-9 && (c.1 - centre.1).abs() < 1e-9);
+    // Made longer, it keeps pointing the same way.
+    s.run("layout.update", &json!({"element": id, "length": 80})).unwrap();
+    let (a, len, ..) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 80.0).abs() < 1e-9);
+    // Two heads, then none: a plain line.
+    s.run("layout.update", &json!({"element": id, "head": "both"})).unwrap();
+    assert_eq!(read(&s, id).2, LineHead::Both);
+
+    // A plain line takes an angle too; other elements don't.
+    let line = s.run("layout.addElement", &json!({"kind": "line", "angle": -30})).unwrap()["element"].as_u64().unwrap() as u32;
+    assert_eq!(read(&s, line).3, "Line");
+    let rect = s.run("layout.addElement", &json!({"kind": "rectangle", "w": 20, "h": 20})).unwrap()["element"].as_u64().unwrap() as u32;
+    for bad in [
+        json!({"element": rect, "angle": 10}),
+        json!({"element": id, "head": "sideways"}),
+        json!({"element": id, "angle": "steep"}),
+        json!({"element": id, "length": 0}),
+        json!({"element": id, "length": -5}),
+    ] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
+    assert!(s.run("layout.addElement", &json!({"kind": "arrow", "head": "up"})).is_err());
+    assert_eq!(read(&s, id).2, LineHead::Both, "bad values changed nothing");
+    // Undo turns it back.
+    s.run("edit.undo", &Value::Null).unwrap(); // the rectangle
+    s.run("edit.undo", &Value::Null).unwrap(); // the line
+    s.run("edit.undo", &Value::Null).unwrap(); // both heads
+    s.run("edit.undo", &Value::Null).unwrap(); // the length
+    let (a, len, ..) = read(&s, id);
+    assert!((a.abs() - 180.0).abs() < 1e-9 && (len - 50.0).abs() < 1e-9);
+}
+
+#[test]
+fn layout_arrows_keep_shallow_and_steep_angles_exactly() {
+    use rustgis_map::layout::{ElementKind, line_angle, line_length};
+    let mut s = world();
+    s.run("layout.new", &json!({"name": "Arrows", "template": "blank"})).unwrap();
+    let li = s.active_layout.unwrap();
+    let read = |s: &Session, id: u32| {
+        let e = s.project.layouts[li].element(id).unwrap();
+        match e.kind {
+            ElementKind::Line { dir, head, .. } => {
+                let r = (e.x, e.y, e.w, e.h);
+                (line_angle(r, dir, head), line_length(r, dir), (e.x, e.y))
+            }
+            ref k => panic!("{k:?}"),
+        }
+    };
+    let add = |s: &mut Session, p: Value| s.run("layout.addElement", &p).unwrap()["element"].as_u64().unwrap() as u32;
+    // A box under 5 mm one way is not stretched to the minimum a dragged element gets.
+    for (angle, length) in [(3.0, 60.0), (85.0, 50.0), (-2.0, 40.0)] {
+        let id = add(&mut s, json!({"kind": "arrow", "angle": angle, "length": length}));
+        let (a, len, _) = read(&s, id);
+        assert!((a - angle).abs() < 1e-9 && (len - length).abs() < 1e-9, "{angle}°: {a}° {len} mm");
+    }
+    // x and y move an angled line without bending it, when added or turned.
+    let id = add(&mut s, json!({"kind": "arrow", "angle": 30, "length": 40, "x": 12, "y": 34}));
+    assert_eq!(read(&s, id).2, (12.0, 34.0));
+    s.run("layout.update", &json!({"element": id, "angle": 60, "x": 50})).unwrap();
+    let (a, len, (x, _)) = read(&s, id);
+    assert!((a - 60.0).abs() < 1e-9 && (len - 40.0).abs() < 1e-9 && x == 50.0, "{a}° {len} mm at {x}");
+    // A length is more than 0 when added too, and a dir doesn't come with an angle or a length.
+    assert!(s.run("layout.addElement", &json!({"kind": "arrow", "angle": 10, "length": 0})).is_err());
+    assert!(s.run("layout.addElement", &json!({"kind": "line", "angle": 10, "dir": "falling"})).is_err());
+    for bad in [json!({"element": id, "dir": "rising", "angle": 10}), json!({"element": id, "dir": "falling", "length": 30})] {
+        assert!(s.run("layout.update", &bad).is_err(), "{bad}");
+    }
 }
 
 #[test]
